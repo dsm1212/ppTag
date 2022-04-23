@@ -9,14 +9,13 @@ import logging
 import urllib
 import time
 import os
+import threading
 from datetime import datetime, date, timedelta
-from threading import Timer
 from watchdog.observers import Observer
 from watchdog.events import PatternMatchingEventHandler
 
 from exif.exifread.tags import DEFAULT_STOP_TAG, FIELD_TYPES
 from exif.exifread import process_file, exif_log, __version__
-from OneShotQueueTimer import OneShotQueueTimer
 from plexUsers import plexUsers
 from lightroomTags import parse_xmp_for_lightroom_tags
 from photoElement import PhotoElement
@@ -26,6 +25,7 @@ from config import ppTagConfig
 logger = exif_log.get_logger()
 
 doUpdate = []
+lock = None
 firstRun = ppTagConfig.FORCE_RUN_AT_START
 
 # plex
@@ -104,7 +104,7 @@ def updateTagsAndRating(key, filename):
 
     parsedXMP = getXMP(data)
     if parsedXMP:
-        logging.info("Updating Tags and Rating: '%s'" % filename)
+        logging.info("Processing '%s'" % filename)
         updateMetadata(key, parsedXMP['tags'], int(parsedXMP['rating'])*2)
     else:
         logging.info("No XMP data for '%s'" % filename)
@@ -120,18 +120,23 @@ def parseExifAndTags(filename):
         parsedXMP['rating'] = 0
         parsedXMP['tags'] = []
 
-    date = datetime.today().date()
-    if 'EXIF DateTimeOriginal' in data:
-        date = datetime.strptime(data['EXIF DateTimeOriginal'].printable, '%Y:%m:%d %H:%M:%S').date()
-    else:
+    try:
+        # Plex has dates with zero H:M:S showing as the prior day when we query so need to subtract one second. i.e. "1995-07-04 00:00:00" will be found in plex on 1995-07-03.
+        origdate = (datetime.strptime(data['EXIF DateTimeOriginal'].printable, '%Y:%m:%d %H:%M:%S') - timedelta(seconds=1)).date()
+        date = origdate
+    except:
         datetimeModified = datetime.fromtimestamp(os.path.getmtime(filename))
         date = datetimeModified.date()
+        pass
         
     return PhotoElement(filename, date, parsedXMP['tags'], parsedXMP['rating'])
 
 def triggerProcess():
     global t
-    t.start()
+    if t is None or not t.is_alive() :
+      logging.info("Starting timer")
+      t = threading.Timer(120,fetchPhotosAndProcess)
+      t.start()
 
 def uniqify(seq):
     # Not order preserving
@@ -147,88 +152,97 @@ def fetchPhotosAndProcess():
         # if a complete update on startup is requested loop through all photos
         loopThroughAllPhotos()
     else:
-        # else fetch all photos based on date
-        if fetchAndProcessByDate():
-            # failed so loop through all photos
-            loopThroughAllPhotos()
+        while len(doUpdate) > 0:
+            # else fetch all photos based on date
+            if fetchAndProcessByDate():
+                # failed so loop through all photos
+                loopThroughAllPhotos()
 
 def fetchAndProcessByDate():
     global doUpdate
-    doUpdateTemp = uniqify(doUpdate)
-    doUpdate = []
+    global lock
+    dateSearchFailed = []
 
-    photoGroups = {}
-    # first group all photos by date
-    for filepath in doUpdateTemp:
-        photoElement = parseExifAndTags(filepath)
-        if photoElement:
-            # this has exif data
-            date = photoElement.date()
-            if date in photoGroups.keys():
-                photoGroups[date].append(photoElement)
-            else:
-                photoGroups[date] = [photoElement]
-        else: # missing or not a photo
-            doUpdateTemp.remove(filepath)
+    while len(doUpdate) > 0:
+        lock.acquire()
+        doUpdateTemp = uniqify(doUpdate)
+        doUpdate = []
+        lock.release()
+    
+        photoGroups = {}
+        # first group all photos by date
+        for filepath in doUpdateTemp[:] :
+            photoElement = parseExifAndTags(filepath)
+            if photoElement:
+                # this has exif data
+                date = photoElement.date()
+                if date in photoGroups.keys():
+                    photoGroups[date].append(photoElement)
+                else:
+                    photoGroups[date] = [photoElement]
+            else: # missing or not a photo
+                doUpdateTemp.remove(filepath)
+    
+        for date in photoGroups.keys():
+            fromTimecode = int(datetime.strptime(date.isoformat(), '%Y-%m-%d').timestamp())
+            toTimecode = int((datetime.strptime(date.isoformat(), '%Y-%m-%d') + timedelta(days=1)).timestamp())-1
+    
+            toDo = True
+            start = 0
+            size = 1000
+    
+            # Make a key list of all pics in the date range
+            plexData = {}
+            if p.photoSection:
+                while toDo:
+                    url = "/library/sections/" + str(p.photoSection) + "/all?originallyAvailableAt%3E=" + str(fromTimecode) + "&originallyAvailableAt%3C=" + str(toTimecode) + "&X-Plex-Container-Start=%i&X-Plex-Container-Size=%i" % (start, size)
+                    logging.debug("URL: %s", url)
+                    metadata = p.fetchPlexApi(url)
+                    container = metadata["MediaContainer"]
+                    if 'Metadata' not in container:
+                       # no photos in this time range (probably wrong section)
+                       break
+                    elements = container["Metadata"]
+                    totalSize = container["totalSize"]
+                    offset = container["offset"]
+                    size = container["size"]
+                    start = start + size
+                    if totalSize-offset-size == 0:
+                        toDo = False
+                    # loop through all elements
+                    for photo in elements:
+                        mediaType = photo["type"]
+                        if mediaType != "photo":
+                            continue
+                        key = photo["ratingKey"]
+                        src = photo["Media"][0]["Part"][0]["file"].replace(ppTagConfig.PHOTOS_LIBRARY_PATH_PLEX,"", 1)
 
-    for date in photoGroups.keys():
-        #print(date)
-        fromTimecode = int(datetime.strptime(date.isoformat(), '%Y-%m-%d').timestamp())
-        toTimecode = int((datetime.strptime(date.isoformat(), '%Y-%m-%d') + timedelta(days=1)).timestamp())-1
+                        #logging.info("  Map: %s -> %s", src, key)
+                        plexData[src] = key
+    
+            # Update the pics that changed in the date range
+            for photo in photoGroups[date]:
+                path = photo.path()
+                # make sure path seperator is equal in plex and ppTag
+                if "/" in ppTagConfig.PHOTOS_LIBRARY_PATH_PLEX:
+                    path = path.replace("\\","/")
+                if path in plexData.keys():
+                    logging.info("Processing by date '%s'" % path)
+                    updateMetadata(plexData[path], photo.tags(), photo.rating()*2)
+                    doUpdateTemp.remove(path)
 
-        toDo = True
-        start = 0
-        size = 1000
+        # if we failed to process something then defer those to a full scan
+        if len(doUpdateTemp):
+            dateSearchFailed = [*dateSearchFailed, *doUpdateTemp]
 
-        # Make a key list of all pics in the date range
-        plexData = {}
-        if p.photoSection:
-            while toDo:
-                url = "/library/sections/" + str(p.photoSection) + "/all?originallyAvailableAt%3E=" + str(fromTimecode) + "&originallyAvailableAt%3C=" + str(toTimecode) + "&X-Plex-Container-Start=%i&X-Plex-Container-Size=%i" % (start, size)
-                metadata = p.fetchPlexApi(url)
-                container = metadata["MediaContainer"]
-                if 'Metadata' not in container:
-                   # no photos in this time range (probably wrong section)
-                   break
-                elements = container["Metadata"]
-                totalSize = container["totalSize"]
-                offset = container["offset"]
-                size = container["size"]
-                start = start + size
-                if totalSize-offset-size == 0:
-                    toDo = False
-                # loop through all elements
-                for photo in elements:
-                    mediaType = photo["type"]
-                    if mediaType != "photo":
-                        continue
-                    key = photo["ratingKey"]
-                    src = photo["Media"][0]["Part"][0]["file"].replace(ppTagConfig.PHOTOS_LIBRARY_PATH_PLEX,"", 1)
-
-                    plexData[src] = key
-
-        # Update the pics that changed in the date range
-        for photo in photoGroups[date]:
-            path = photo.path()
-            # make sure path seperator is equal in plex and ppTag
-            if "/" in ppTagConfig.PHOTOS_LIBRARY_PATH_PLEX:
-                path = path.replace("\\","/")
-            if path in plexData.keys():
-                logging.info("Updating modified file '%s'" % path)
-                updateMetadata(plexData[path], photo.tags(), photo.rating()*2)
-                photoGroups[date].remove(photo)
-                doUpdateTemp.remove(path)
-
-    # if we failed to process something then try a full scan
-    if len(doUpdateTemp):
+    # if we failed to process something then trigger a full scan
+    if len(dateSearchFailed) > 0:
         logging.warning("Some updated files were not found by date range.")
-        doUpdate = [*doUpdate, *doUpdateTemp]
+        lock.acquire()
+        doUpdate = [*dateSearchFailed, *doUpdate]
+        lock.release()
         return True
 
-    # after the loop we maybe have new or modifed files which was blocked before so trigger again
-    if len(doUpdate):
-        triggerProcess()
-    
     return False
 
 def loopThroughAllPhotos():
@@ -281,10 +295,6 @@ def loopThroughAllPhotos():
         for src in doUpdateTemp:
             logging.info("Skipped file not found in this section '%s'" % src)		 
     
-    # after the loop we maybe have new or modifed files which was blocked before so trigger again
-    if len(doUpdate):
-        triggerProcess()
-
     firstRun = False
 
 
@@ -309,8 +319,10 @@ class PhotoHandler(PatternMatchingEventHandler):
                         # put file into forced update list
                         pptag_path=event.src_path.replace(ppTagConfig.PHOTOS_LIBRARY_PATH,"", 1)
                         if pptag_path not in doUpdate:
-                            logging.info("Queued for update: '%s'", event.src_path)
+                            logging.info("Queued '%s'", event.src_path)
+                            lock.acquire()
                             doUpdate.append(pptag_path)
+                            lock.release()
                             triggerProcess()
                         return
                 logging.debug("Ignored file in wrong location: '%s'" % event.src_path)
@@ -328,13 +340,11 @@ if __name__ == '__main__':
          ppTagConfig.LOG_LEVEL = 'CRITICAL'
     logging.basicConfig(level=getattr(logging,ppTagConfig.LOG_LEVEL), format='%(asctime)s %(levelname)s - %(message)s')
 
+    lock = threading.Lock()
+
     # setup observer
     observer = Observer()
     observer.schedule(PhotoHandler(), path=ppTagConfig.PHOTOS_LIBRARY_PATH, recursive=True)
-
-    # setup timer
-    # wait 120 sec after change was detected
-    t = OneShotQueueTimer(120, fetchPhotosAndProcess)
 
     p = plexUsers()
 

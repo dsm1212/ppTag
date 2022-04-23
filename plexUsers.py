@@ -3,6 +3,7 @@
 # pip install xmltodict
 
 import http.client
+import ssl
 import xmltodict
 import json
 import urllib
@@ -44,8 +45,15 @@ class plexUsers():
             url = 'plex.tv'
             connection = http.client.HTTPSConnection(url)
         else:
-            url = ppTagConfig.PLEX_URL.rstrip('/').replace('http://','')
-            connection = http.client.HTTPConnection(url)
+            url = ppTagConfig.PLEX_URL.rstrip('/')
+            https=False
+            if url.count('https') > 0:
+                https=True
+            url = url.replace('http://','').replace('https://','')
+            if https:
+                connection = http.client.HTTPSConnection(url, context=ssl._create_unverified_context())
+            else:
+                connection = http.client.HTTPConnection(url)
 
         try:
             if method.upper() == 'GET':
@@ -90,6 +98,10 @@ class plexUsers():
             if 'authToken' in data:
                 authToken = data['authToken']
                 data = self.fetchPlexApi('/api/resources?includeHttps=1&includeRelay=1&X-Plex-Client-Identifier={clientid}'.format(clientid=self.clientId), 'GET', True, authToken)
+                if not 'MediaContainer' in data.keys():
+                    break
+                if not 'Device' in data['MediaContainer'].keys():
+                    break
                 for device in data['MediaContainer']['Device']:
                     if isinstance(device, dict):
                         if device.get('@provides') == 'server' and device.get('@name') == ppTagConfig.SERVERNAME:
