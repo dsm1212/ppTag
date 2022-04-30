@@ -34,6 +34,9 @@ p = None
 # timer
 t = None
 
+# last incoming event time
+lastTS = datetime.now()
+
 def updateMetadata(item, tags, rating):
 
     # update rating
@@ -121,41 +124,47 @@ def parseExifAndTags(filename):
         parsedXMP['tags'] = []
 
     try:
-        # Plex has dates with zero H:M:S showing as the prior day when we query so need to subtract one second. i.e. "1995-07-04 00:00:00" will be found in plex on 1995-07-03.
-        origdate = (datetime.strptime(data['EXIF DateTimeOriginal'].printable, '%Y:%m:%d %H:%M:%S') - timedelta(seconds=1)).date()
-        date = origdate
+        date = datetime.fromtimestamp(datetime.strptime(data['EXIF DateTimeOriginal'].printable+data['EXIF Tag 0x9011'].printable, '%Y:%m:%d %H:%M:%S%z').timestamp()).date()
     except:
-        datetimeModified = datetime.fromtimestamp(os.path.getmtime(filename))
-        date = datetimeModified.date()
-        pass
+        try:
+            date = datetime.strptime(data['EXIF DateTimeOriginal'].printable, '%Y:%m:%d %H:%M:%S').date()
+        except:
+            # fallback to the modify date on the file
+            datetimeModified = datetime.fromtimestamp(os.path.getmtime(filename))
+            date = datetimeModified.date()
         
     return PhotoElement(filename, date, parsedXMP['tags'], parsedXMP['rating'])
 
 def triggerProcess():
     global t
+    global lastTS
+
+    lastTS  = datetime.now()
     if t is None or not t.is_alive() :
       logging.info("Starting timer")
       t = threading.Timer(120,fetchPhotosAndProcess)
       t.start()
 
 def uniqify(seq):
-    # Not order preserving
-    keys = {}
-    for e in seq:
-        keys[e] = 1
-    return list(keys.keys())
+    return list(dict.fromkeys(seq)) # order preserving
 
 def fetchPhotosAndProcess():
     global firstRun
+    global lastTS
 
-    if firstRun:
-        # if a complete update on startup is requested loop through all photos
+    if firstRun: # complete update on startup requested
         loopThroughAllPhotos()
-    else:
+    else: # must be in the timer thread so process backlog
+        # keep processing until there is nothing more to do so we don't have to worry about missed triggers
         while len(doUpdate) > 0:
-            # else fetch all photos based on date
+
+            # wait for 120 seconds of idle time so that plex can process any creates first
+            while datetime.now()-lastTS < timedelta(seconds=120):
+                time.sleep(120-(datetime.now()-lastTS).total_seconds()+1)
+
+            # Try to find all photos based on date
             if fetchAndProcessByDate():
-                # failed so loop through all photos
+                # failed so loop through all photoa to find the rest
                 loopThroughAllPhotos()
 
 def fetchAndProcessByDate():
@@ -196,7 +205,7 @@ def fetchAndProcessByDate():
             if p.photoSection:
                 while toDo:
                     url = "/library/sections/" + str(p.photoSection) + "/all?originallyAvailableAt%3E=" + str(fromTimecode) + "&originallyAvailableAt%3C=" + str(toTimecode) + "&X-Plex-Container-Start=%i&X-Plex-Container-Size=%i" % (start, size)
-                    logging.debug("URL: %s", url)
+                    #logging.info("URL: %s", url)
                     metadata = p.fetchPlexApi(url)
                     container = metadata["MediaContainer"]
                     if 'Metadata' not in container:
@@ -311,8 +320,8 @@ class PhotoHandler(PatternMatchingEventHandler):
         event.src_path
             path/to/observed/file
         """
-        if (event.event_type == 'modified' or event.event_type ==  'created' or event.event_type == 'moved'):
-            if not event.is_directory:
+        if not event.is_directory:
+            if (event.event_type == 'modified' or event.event_type ==  'created' or event.event_type == 'moved'):
 		# check if file belongs to monitored section
                 for folder in p.photoLocations:
                     if event.src_path.startswith(folder):
@@ -326,6 +335,8 @@ class PhotoHandler(PatternMatchingEventHandler):
                             triggerProcess()
                         return
                 logging.debug("Ignored file in wrong location: '%s'" % event.src_path)
+            else:
+                logging.info("Ignored event '%s' for file '%s'" % (event.event_type,event.src_path))
 
     def on_modified(self, event):
         self.process(event)
@@ -339,6 +350,9 @@ if __name__ == '__main__':
     if ppTagConfig.LOG_LEVEL is None or ppTagConfig.LOG_LEVEL == '':
          ppTagConfig.LOG_LEVEL = 'CRITICAL'
     logging.basicConfig(level=getattr(logging,ppTagConfig.LOG_LEVEL), format='%(asctime)s %(levelname)s - %(message)s')
+
+    if ppTagConfig.TIMEZONE is not None :
+         os.environ['TZ'] = ppTagConfig.TIMEZONE
 
     lock = threading.Lock()
 
