@@ -38,4 +38,7 @@ class ppTagConfig():
     # set logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
     LOG_LEVEL = 'ERROR'
 
+    # set timezone the same as your plex server (e.g. America/New_York)
+    TIMEZONE = ''
+
     ###########################################################
