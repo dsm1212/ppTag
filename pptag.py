@@ -336,7 +336,7 @@ class PhotoHandler(PatternMatchingEventHandler):
                         return
                 logging.debug("Ignored file in wrong location: '%s'" % event.src_path)
             else:
-                logging.info("Ignored event '%s' for file '%s'" % (event.event_type,event.src_path))
+                logging.debug("Ignored event '%s' for file '%s'" % (event.event_type,event.src_path))
 
     def on_modified(self, event):
         self.process(event)
